@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aws-kms-plugin
+  namespace: openshift-kube-apiserver
+spec:
+  selector:
+    matchLabels:
+      name: aws-kms-plugin
+  template:
+    metadata:
+      labels:
+        name: aws-kms-plugin
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - image: quay.io/swghosh/aws-cloud-kms
+        name: aws-kms-plugin
+        args:
+        - --debug
+        - --health-port=:18081
+        - --key=arn:aws:kms:us-east-2:301721915996:key/f319b2a3-ddcd-48ce-bda2-e45d401a3b40
+        - --listen=/var/kms/socket.sock
+        - --region=us-east-2
+        ports:
+        - containerPort: 18081
+          protocol: TCP
+          name: check-kms
+        livenessProbe:
+          httpGet:
+            scheme: HTTP
+            port: 18081
+            path: livez
+          initialDelaySeconds: 15
+          timeoutSeconds: 10
+          periodSeconds: 60
+        readinessProbe:
+          httpGet:
+            scheme: HTTP
+            port: 18081
+            path: healthz
+          initialDelaySeconds: 10
+          timeoutSeconds: 10
+        volumeMounts:
+        - mountPath: /var/kms
+          name: socket-dir
+      hostNetwork: true
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/kube-kms/f9765027f16f24d5
+            type: DirectoryOrCreate
