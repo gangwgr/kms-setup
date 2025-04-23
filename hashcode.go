@@ -54,7 +54,7 @@ func main() {
 			KeyARN: "arn:aws:kms:us-east-2:301721915996:key/f319b2a3-ddcd-48ce-bda2-e45d401a3b40",
 			Region: "us-east-2",
 		},
-	}, 1)
+	})
 	if err != nil {
 		panic(err)
 	}
