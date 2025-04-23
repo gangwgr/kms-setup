@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export AWS_REGION="us-east-2"
-export KMS_KEY_NAME="rgangwar-openshift-cluster-kek4"
+export KMS_KEY_NAME=$2
 
 # Extract AWS credentials from the secret
 AWS_ACCESS_KEY_ID=$(oc get secret/aws-creds -n kube-system -o json | jq -r '.data.aws_access_key_id' | base64 -d)
@@ -21,7 +21,7 @@ AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
     --output text)
 
 # Discover the actual IAM master role name from CloudFormation
-MASTER_ROLE_NAME=rgangwarkms-22-sg-MasterIamRole-9wR6bbo94EiR
+MASTER_ROLE_NAME=$1
 echo "Discovered master IAM role: ${MASTER_ROLE_NAME}"
 
 # Create a new KMS key
