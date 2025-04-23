@@ -39,19 +39,19 @@ func hashKMSConfig(config configv1.KMSConfig) (string, error) {
 }
 
 // GenerateKMSKeyId generates a hash-ed KMS key id appended with an id integer
-func GenerateKMSKeyId(kmsConfig configv1.KMSConfig, nonce uint64) (string, error) {
+func GenerateKMSKeyId(kmsConfig configv1.KMSConfig) (string, error) {
 	hash, err := hashKMSConfig(kmsConfig)
 	if err != nil {
 		return "", fmt.Errorf("could not generate KMS config hash: %v", err)
 	}
-	return fmt.Sprintf("%s-%d", hash, nonce), nil
+	return fmt.Sprintf("%s", hash), nil
 }
 
 func main() {
 	keyId, err := GenerateKMSKeyId(configv1.KMSConfig{
 		Type: configv1.AWSKMSProvider,
 		AWS: &configv1.AWSKMSConfig{
-			KeyARN: "arn:aws:kms:us-east-2:301721915996:key/f319b2a3-ddcd-48ce-bda2-e45d401a3b40",
+			KeyARN: "arn:aws:kms:us-east-2:301721915996:key/cfa1c070-100c-4b48-afe2-b916f31a525c",
 			Region: "us-east-2",
 		},
 	})
@@ -60,4 +60,3 @@ func main() {
 	}
 	fmt.Println(keyId)
 }
-
