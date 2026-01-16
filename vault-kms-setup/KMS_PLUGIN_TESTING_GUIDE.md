@@ -43,6 +43,12 @@ oc scale deployment/kube-apiserver-operator \
 # Scale down the authentication-operator
 oc scale deployment/authentication-operator \
   -n openshift-authentication-operator --replicas=0
+
+#  Scale down the openshift-apiserver-operator
+oc patch openshiftapiserver cluster --type=merge -p '{"spec":{"managementState":"Unmanaged"}}'
+openshiftapiserver.operator.openshift.io/cluster patched
+oc scale deployment/openshift-apiserver-operator   \
+  -n openshift-apiserver-operator --replicas=0
 ```
 
 Verify operators are scaled down:
@@ -50,6 +56,7 @@ Verify operators are scaled down:
 ```bash
 oc get deployment -n openshift-kube-apiserver-operator
 oc get deployment -n openshift-authentication-operator
+oc get deployment -n openshift-apiserver-operator
 ```
 
 Expected output:
@@ -57,6 +64,7 @@ Expected output:
 NAME                      READY   UP-TO-DATE   AVAILABLE   AGE
 kube-apiserver-operator   0/0     0            0           XXm
 authentication-operator   0/0     0            0           XXm
+openshift-apiserver-operator   0/0     0            0           XXm
 ```
 
 ---
