@@ -1,114 +1,166 @@
-# Testing KMS Plugin on Standard OpenShift Cluster
+# KMS Plugin Testing Guide for OpenShift
 
-This guide provides steps to manually test a KMS plugin (e.g., HashiCorp Vault) on a standard OpenShift cluster by disabling the relevant operators and manually configuring encryption.
+This guide provides step-by-step instructions for testing a KMS (Key Management Service) plugin on an OpenShift cluster by manually configuring encryption.
+
+## ⚠️ Important Warnings
+
+- **Test/Development Clusters Only**: These procedures should NEVER be performed on production clusters
+- **Backup Required**: Always backup your cluster configuration before proceeding
+- **Cluster Risk**: Incorrect configuration can render your cluster unusable
+- **Recovery Plan**: Have a documented recovery/rollback procedure ready
 
 ## Prerequisites
 
-- Access to an OpenShift cluster with cluster-admin privileges
+- OpenShift 4.x cluster with cluster-admin privileges
 - `oc` CLI tool configured and authenticated
-- Your KMS plugin container image available
+- KMS plugin container image available
 - KMS service (e.g., Vault) accessible from the cluster
+- Control plane node access (SSH or `oc debug node`)
 
-## Overview
+## Architecture Overview
 
-The process involves:
-1. Marking apiserver operators as Unmanaged
-2. Scaling down the operators
-3. Deploying the KMS plugin as a static pod on control plane nodes
-4. Creating and injecting custom encryption configuration
-5. Restarting apiservers to pick up the new configuration
-
----
-
-## Step 1: Mark Operators as Unmanaged
-
-First, we need to prevent the operators from managing the apiservers:
-
-```bash
-# Mark the Kubernetes API Server operator as Unmanaged
-oc patch kubeapiserver cluster --type=merge -p '{"spec":{"managementState":"Unmanaged"}}'
-
-# Mark the OpenShift API Server operator as Unmanaged
-oc patch openshiftapiserver cluster --type=merge -p '{"spec":{"managementState":"Unmanaged"}}'
-
-# Mark the Authentication operator as Unmanaged
-oc patch authentication cluster --type=merge -p '{"spec":{"managementState":"Unmanaged"}}'
 ```
-
-Verify the operators are marked as Unmanaged:
-
-```bash
-oc get kubeapiserver cluster -o jsonpath='{.spec.managementState}'
-oc get openshiftapiserver cluster -o jsonpath='{.spec.managementState}'
-oc get authentication cluster -o jsonpath='{.spec.managementState}'
+┌─────────────────┐      ┌──────────────────┐      ┌─────────────┐
+│ kube-apiserver  │─────▶│  KMS Plugin Pod  │─────▶│  KMS Service│
+│                 │ unix │  (Static Pod)    │ API  │  (Vault)    │
+└─────────────────┘socket└──────────────────┘      └─────────────┘
+        │                                                  │
+        └──────────────────────────────────────────────────┘
+                    Encrypt/Decrypt Operations
 ```
 
 ---
 
-## Step 2: Scale Down Operator Deployments
+## Step 1: Scale Down Operators
 
-Scale down the operator deployments to prevent them from reverting changes:
+**Important Note**: The `kubeapiserver` and `authentication` resources do NOT support `managementState: Unmanaged`. You can only scale down the operator deployments.
 
 ```bash
-# Scale down the Kube API Server operator
-oc scale deployment kube-apiserver-operator -n openshift-kube-apiserver-operator --replicas=0
+# Scale down the kube-apiserver-operator
+oc scale deployment/kube-apiserver-operator \
+  -n openshift-kube-apiserver-operator --replicas=0
 
-# Scale down the OpenShift API Server operator
-oc scale deployment openshift-apiserver-operator -n openshift-apiserver-operator --replicas=0
-
-# Scale down the Cluster Authentication operator
-oc scale deployment authentication-operator -n openshift-authentication-operator --replicas=0
+# Scale down the authentication-operator
+oc scale deployment/authentication-operator \
+  -n openshift-authentication-operator --replicas=0
 ```
 
-Verify the operators are scaled down:
+Verify operators are scaled down:
 
 ```bash
-oc get deployment -n openshift-kube-apiserver-operator kube-apiserver-operator
-oc get deployment -n openshift-apiserver-operator openshift-apiserver-operator
-oc get deployment -n openshift-authentication-operator authentication-operator
+oc get deployment -n openshift-kube-apiserver-operator
+oc get deployment -n openshift-authentication-operator
+```
+
+Expected output:
+```
+NAME                      READY   UP-TO-DATE   AVAILABLE   AGE
+kube-apiserver-operator   0/0     0            0           XXm
+authentication-operator   0/0     0            0           XXm
 ```
 
 ---
 
-## Step 3: Deploy KMS Plugin as Static Pod
+## Step 2: Deploy KMS Plugin
 
-The KMS plugin needs to run as a static pod on all control plane nodes.
+The KMS plugin must run on all control plane nodes. You have two deployment options:
 
-### 3.1 Create KMS Plugin Configuration
+### Option A: DaemonSet (Recommended)
 
-First, create the configuration for your KMS plugin (example for Vault):
+Create a KMS plugin DaemonSet:
 
 ```bash
-# Create a ConfigMap with KMS plugin configuration
-cat <<EOF | oc apply -f -
-apiVersion: v1
-kind: ConfigMap
+cat > kms-plugin-daemonset.yaml <<'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
 metadata:
-  name: kms-plugin-config
+  name: vault-kms-plugin
   namespace: openshift-kube-apiserver
-data:
-  vault-config.yaml: |
-    # Your KMS plugin configuration
-    # Example for Vault:
-    vaultAddress: "https://vault.example.com:8200"
-    vaultNamespace: "kms"
-    tokenPath: "/var/run/secrets/vault/token"
+spec:
+  selector:
+    matchLabels:
+      name: vault-kms-plugin
+  template:
+    metadata:
+      labels:
+        name: vault-kms-plugin
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: vault-kms-plugin
+        image: registry.k8s.io/kms/vault:v0.9.0
+        args:
+        - --debug
+        - --listen=/var/run/kmsplugin/socket.sock
+        - --vault-address=http://vault.vault.svc.cluster.local:8200
+        - --vault-transit-path=transit
+        - --vault-transit-key=kubernetes-encryption
+        - --vault-role-id=$(VAULT_ROLE_ID)
+        - --vault-secret-id=$(VAULT_SECRET_ID)
+        env:
+        - name: VAULT_ROLE_ID
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: role-id
+        - name: VAULT_SECRET_ID
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: secret-id
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /var/run/kmsplugin
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - test -S /var/run/kmsplugin/socket.sock
+          initialDelaySeconds: 15
+          periodSeconds: 30
+      hostNetwork: true
+      volumes:
+      - name: socket-dir
+        hostPath:
+          path: /var/run/kmsplugin
+          type: DirectoryOrCreate
 EOF
+
+# Create credentials secret first
+oc create secret generic vault-kms-credentials \
+  -n openshift-kube-apiserver \
+  --from-literal=role-id="<YOUR_ROLE_ID>" \
+  --from-literal=secret-id="<YOUR_SECRET_ID>"
+
+# Deploy the DaemonSet
+oc apply -f kms-plugin-daemonset.yaml
 ```
 
-### 3.2 Create Static Pod Manifest
-
-Create the static pod manifest on each control plane node. You'll need to SSH to each control plane node:
+Verify KMS plugin pods are running:
 
 ```bash
-# List control plane nodes
-oc get nodes -l node-role.kubernetes.io/master
+oc get pods -n openshift-kube-apiserver -l name=vault-kms-plugin -o wide
+```
 
-# For each control plane node, execute:
-for node in $(oc get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}'); do
-  echo "Configuring KMS plugin on node: $node"
+### Option B: Static Pods
 
-  # Create the static pod manifest
+If you prefer static pods, create the manifest on each control plane node:
+
+```bash
+# Get control plane nodes
+CONTROL_PLANE_NODES=$(oc get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}')
+
+# For each node
+for node in $CONTROL_PLANE_NODES; do
+  echo "Deploying KMS plugin on node: $node"
+
   oc debug node/$node -- chroot /host bash -c 'cat > /etc/kubernetes/manifests/kms-plugin.yaml <<EOF
 apiVersion: v1
 kind: Pod
@@ -119,64 +171,47 @@ spec:
   hostNetwork: true
   containers:
   - name: kms-plugin
-    image: <YOUR_KMS_PLUGIN_IMAGE>
-    imagePullPolicy: IfNotPresent
+    image: registry.k8s.io/kms/vault:v0.9.0
     command:
     - /kms-plugin
     args:
     - --listen=/var/run/kmsplugin/socket.sock
-    - --config=/etc/kms-config/vault-config.yaml
+    - --vault-address=http://vault.vault.svc.cluster.local:8200
+    - --vault-transit-path=transit
+    - --vault-transit-key=kubernetes-encryption
     volumeMounts:
     - name: kmsplugin
       mountPath: /var/run/kmsplugin
-    - name: kms-config
-      mountPath: /etc/kms-config
-      readOnly: true
     resources:
       requests:
         cpu: 100m
         memory: 128Mi
-      limits:
-        cpu: 200m
-        memory: 256Mi
   volumes:
   - name: kmsplugin
     hostPath:
       path: /var/run/kmsplugin
-      type: DirectoryOrCreate
-  - name: kms-config
-    hostPath:
-      path: /etc/kubernetes/kms-config
       type: DirectoryOrCreate
   priorityClassName: system-node-critical
 EOF'
 done
 ```
 
-### 3.3 Verify KMS Plugin Pods are Running
-
-```bash
-# Check on each control plane node
-oc get pods -n kube-system -o wide | grep kms-plugin
-```
-
 ---
 
-## Step 4: Create Encryption Configuration
+## Step 3: Create Encryption Configuration
 
-Create the encryption configuration that references your KMS plugin:
+Create the encryption configuration file:
 
 ```bash
-cat <<EOF > encryption-config.yaml
+cat > encryption-config.yaml <<'EOF'
 apiVersion: apiserver.config.k8s.io/v1
 kind: EncryptionConfiguration
 resources:
   - resources:
       - secrets
-      - configmaps
     providers:
       - kms:
-          name: vault-kms-plugin
+          name: vault-kms
           endpoint: unix:///var/run/kmsplugin/socket.sock
           cachesize: 1000
           timeout: 3s
@@ -184,252 +219,401 @@ resources:
 EOF
 ```
 
----
-
-## Step 5: Inject Encryption Configuration into API Servers
-
-### 5.1 For Kubernetes API Server
+Create the encryption configuration secret:
 
 ```bash
-# Create a Secret with the encryption configuration
 oc create secret generic encryption-config \
-  --from-file=encryption-config=encryption-config.yaml \
   -n openshift-kube-apiserver \
-  --dry-run=client -o yaml | oc apply -f -
-
-# Get the current kube-apiserver pod specification
-oc get pod -n openshift-kube-apiserver -l app=openshift-kube-apiserver -o yaml > kube-apiserver-pod.yaml
-
-# Edit the pod specification to add encryption configuration
-# You need to add the following to the kube-apiserver container:
-# 1. --encryption-provider-config=/etc/kubernetes/encryption-config/encryption-config.yaml
-# 2. Mount the encryption-config secret as a volume
+  --from-file=encryption-config=encryption-config.yaml
 ```
 
-For each control plane node, update the static pod manifest:
+---
+
+## Step 4: Patch API Server Static Pods
+
+You need to manually update the kube-apiserver static pod manifests on each control plane node.
+
+### 4.1 Backup Current Configuration
 
 ```bash
-for node in $(oc get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}'); do
-  echo "Updating kube-apiserver on node: $node"
+for node in $(oc get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}'); do
+  echo "Backing up kube-apiserver manifest on node: $node"
 
   oc debug node/$node -- chroot /host bash -c '
-    # Backup the current configuration
-    cp /etc/kubernetes/manifests/kube-apiserver-pod.yaml /etc/kubernetes/manifests/kube-apiserver-pod.yaml.backup
+    cp /etc/kubernetes/manifests/kube-apiserver-pod.yaml \
+       /etc/kubernetes/manifests/kube-apiserver-pod.yaml.backup
 
-    # Copy the encryption config
     mkdir -p /etc/kubernetes/encryption-config
-    cat > /etc/kubernetes/encryption-config/encryption-config.yaml <<EOC
+  '
+done
+```
+
+### 4.2 Copy Encryption Configuration
+
+```bash
+for node in $(oc get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}'); do
+  echo "Deploying encryption config on node: $node"
+
+  oc debug node/$node -- chroot /host bash -c 'cat > /etc/kubernetes/encryption-config/encryption-config.yaml <<EOF
 apiVersion: apiserver.config.k8s.io/v1
 kind: EncryptionConfiguration
 resources:
   - resources:
       - secrets
-      - configmaps
     providers:
       - kms:
-          name: vault-kms-plugin
+          name: vault-kms
           endpoint: unix:///var/run/kmsplugin/socket.sock
           cachesize: 1000
           timeout: 3s
       - identity: {}
-EOC
-  '
+EOF'
 done
 ```
 
-### 5.2 Update Kube API Server Static Pod
+### 4.3 Manual Manifest Update
 
-You need to modify the kube-apiserver static pod to:
-1. Add the `--encryption-provider-config` flag
-2. Mount the encryption configuration
-3. Mount the KMS plugin socket
+For each control plane node, you need to manually edit the kube-apiserver manifest:
 
 ```bash
-for node in $(oc get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}'); do
-  echo "Patching kube-apiserver on node: $node"
+# Access the node
+oc debug node/<NODE_NAME> -- chroot /host bash
 
-  oc debug node/$node -- chroot /host bash -c '
-    # Edit the kube-apiserver manifest
-    # This is a complex operation - you may need to do this manually
-    # Add the following to the kube-apiserver container args:
-    # - --encryption-provider-config=/etc/kubernetes/encryption-config/encryption-config.yaml
-
-    # Add these volume mounts:
-    # - mountPath: /etc/kubernetes/encryption-config
-    #   name: encryption-config
-    # - mountPath: /var/run/kmsplugin
-    #   name: kmsplugin
-
-    # Add these volumes:
-    # - hostPath:
-    #     path: /etc/kubernetes/encryption-config
-    #     type: DirectoryOrCreate
-    #   name: encryption-config
-    # - hostPath:
-    #     path: /var/run/kmsplugin
-    #     type: DirectoryOrCreate
-    #   name: kmsplugin
-
-    # The kubelet will automatically restart the pod when the manifest changes
-  '
-done
+# Edit the manifest
+vi /etc/kubernetes/manifests/kube-apiserver-pod.yaml
 ```
 
-### 5.3 For OpenShift API Server
+**Add to `spec.containers[name=kube-apiserver].command`:**
+```yaml
+- --encryption-provider-config=/etc/kubernetes/encryption-config/encryption-config.yaml
+```
 
-Similar process for the OpenShift API Server:
+**Add to `spec.containers[name=kube-apiserver].volumeMounts`:**
+```yaml
+- name: encryption-config
+  mountPath: /etc/kubernetes/encryption-config
+  readOnly: true
+- name: kms-socket
+  mountPath: /var/run/kmsplugin
+```
+
+**Add to `spec.volumes`:**
+```yaml
+- name: encryption-config
+  hostPath:
+    path: /etc/kubernetes/encryption-config
+    type: DirectoryOrCreate
+- name: kms-socket
+  hostPath:
+    path: /var/run/kmsplugin
+    type: DirectoryOrCreate
+```
+
+**Save the file. The kubelet will automatically restart the API server pod.**
+
+---
+
+## Step 5: Verify Configuration
+
+### 5.1 Check API Server Pods
 
 ```bash
-for node in $(oc get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}'); do
-  echo "Updating openshift-apiserver on node: $node"
+# Check that API server pods are running
+oc get pods -n openshift-kube-apiserver -l app=openshift-kube-apiserver
 
-  oc debug node/$node -- chroot /host bash -c '
-    # Backup the current configuration
-    cp /etc/kubernetes/manifests/openshift-apiserver-pod.yaml /etc/kubernetes/manifests/openshift-apiserver-pod.yaml.backup 2>/dev/null || true
+# Check logs for KMS-related messages
+oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver --tail=50 | grep -i kms
+```
 
-    # Apply similar changes to openshift-apiserver
-    # Add encryption configuration and KMS plugin socket mount
-  '
+Expected log entries:
+```
+I0116 loaded encryption config: vault-kms
+I0116 KMS plugin vault-kms initialized successfully
+```
+
+### 5.2 Check KMS Plugin
+
+```bash
+# Check KMS plugin pods
+oc get pods -n openshift-kube-apiserver -l name=vault-kms-plugin
+
+# Check KMS plugin logs
+oc logs -n openshift-kube-apiserver -l name=vault-kms-plugin --tail=50
+```
+
+### 5.3 Verify Socket Connectivity
+
+```bash
+# Check that socket exists on each control plane node
+for node in $(oc get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}'); do
+  echo "Checking socket on node: $node"
+  oc debug node/$node -- chroot /host ls -la /var/run/kmsplugin/socket.sock
 done
 ```
 
 ---
 
-## Step 6: Verify KMS Plugin is Working
+## Step 6: Test Encryption
 
-### 6.1 Check API Server Logs
-
-```bash
-# Check kube-apiserver logs for KMS plugin communication
-oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver --tail=100 | grep -i kms
-
-# Check for any errors
-oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver --tail=100 | grep -i error
-```
-
-### 6.2 Test Encryption
-
-Create a test secret and verify it's encrypted:
+### 6.1 Create Test Secret
 
 ```bash
 # Create a test secret
-oc create secret generic test-kms-secret \
+oc create secret generic test-kms-encryption \
   --from-literal=password=supersecret \
   -n default
-
-# Verify the secret is encrypted in etcd
-# You'll need to access etcd directly for this
-oc get secret test-kms-secret -n default -o yaml
-
-# The secret should be encrypted via KMS in etcd
-# You can verify by checking etcd directly:
-oc exec -n openshift-etcd etcd-<control-plane-node> -- \
-  etcdctl get /kubernetes.io/secrets/default/test-kms-secret \
-  --print-value-only | hexdump -C
 ```
 
-### 6.3 Check KMS Plugin Logs
+### 6.2 Verify Secret is Encrypted
 
 ```bash
-# Check KMS plugin logs on control plane nodes
-oc debug node/<control-plane-node> -- chroot /host crictl logs <kms-plugin-container-id>
+# Get the secret
+oc get secret test-kms-encryption -n default -o yaml
+
+# Look for encryption metadata
+# The secret should have metadata indicating KMS encryption
+```
+
+### 6.3 Verify in etcd (Optional)
+
+If you have etcd access:
+
+```bash
+# Access etcd pod
+ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o jsonpath='{.items[0].metadata.name}')
+
+# Check the secret in etcd (it should be encrypted)
+oc exec -n openshift-etcd $ETCD_POD -- etcdctl get \
+  /kubernetes.io/secrets/default/test-kms-encryption \
+  --print-value-only | hexdump -C
+
+# Should show encrypted data starting with "k8s:enc:kms:v1:vault-kms:"
+```
+
+### 6.4 Test Decryption
+
+```bash
+# Retrieve the secret - if decryption works, you'll see the value
+oc get secret test-kms-encryption -n default -o jsonpath='{.data.password}' | base64 -d
+
+# Should output: supersecret
 ```
 
 ---
 
 ## Step 7: Migrate Existing Secrets (Optional)
 
-If you want to re-encrypt existing secrets with the new KMS plugin:
+To re-encrypt existing secrets with the new KMS plugin:
 
 ```bash
-# This will read and write all secrets, triggering re-encryption
-oc get secrets --all-namespaces -o json | \
-  oc replace -f -
+# Re-encrypt all secrets in a specific namespace
+oc get secrets -n <namespace> -o json | oc replace -f -
+
+# Or use the storage migration tool (if available)
+oc adm migrate storage secrets --confirm
 ```
 
-**Warning**: This operation can be resource-intensive on large clusters.
+**Warning**: This can be resource-intensive on large clusters.
+
+---
+
+## Step 8: Scale Operators Back Up
+
+Once everything is verified and working:
+
+```bash
+# Scale kube-apiserver-operator back up
+oc scale deployment/kube-apiserver-operator \
+  -n openshift-kube-apiserver-operator --replicas=1
+
+# Scale authentication-operator back up
+oc scale deployment/authentication-operator \
+  -n openshift-authentication-operator --replicas=1
+```
+
+Verify operators are running:
+
+```bash
+oc get deployment -n openshift-kube-apiserver-operator
+oc get deployment -n openshift-authentication-operator
+```
+
+**Note**: The operators will now manage the API servers again. Ensure your KMS configuration persists through operator reconciliation.
 
 ---
 
 ## Troubleshooting
 
-### KMS Plugin Not Responding
+### Issue: API Server Won't Start
 
+**Symptoms**: API server pods in CrashLoopBackOff
+
+**Check**:
 ```bash
-# Check if the socket exists
-for node in $(oc get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}'); do
-  echo "Checking socket on node: $node"
-  oc debug node/$node -- chroot /host ls -la /var/run/kmsplugin/
-done
+# Check API server logs
+oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver --tail=100
 
-# Check KMS plugin logs
-oc debug node/<node> -- chroot /host crictl logs <container-id>
-```
-
-### API Server Fails to Start
-
-```bash
-# Check kubelet logs
+# Check kubelet logs on control plane node
 oc debug node/<node> -- chroot /host journalctl -u kubelet -n 100
-
-# Check for static pod errors
-oc debug node/<node> -- chroot /host ls -la /etc/kubernetes/manifests/
 ```
 
-### Restore to Original State
+**Common causes**:
+- Encryption config file not found
+- KMS socket not accessible
+- KMS plugin not running
+- Invalid encryption configuration syntax
 
-If you need to revert the changes:
+**Solution**:
+1. Verify encryption config exists: `/etc/kubernetes/encryption-config/encryption-config.yaml`
+2. Verify KMS socket exists: `/var/run/kmsplugin/socket.sock`
+3. Check KMS plugin is running and healthy
+
+### Issue: KMS Plugin Not Responding
+
+**Symptoms**: API server logs show KMS timeout errors
+
+**Check**:
+```bash
+# Check KMS plugin logs
+oc logs -n openshift-kube-apiserver -l name=vault-kms-plugin
+
+# Check socket permissions
+oc debug node/<node> -- chroot /host ls -la /var/run/kmsplugin/
+```
+
+**Solution**:
+1. Verify Vault service is accessible
+2. Verify AppRole credentials are correct
+3. Check network connectivity between KMS plugin and Vault
+4. Increase timeout in encryption config if needed
+
+### Issue: Secrets Not Being Encrypted
+
+**Symptoms**: New secrets are created but not encrypted via KMS
+
+**Check**:
+```bash
+# Verify encryption config is loaded
+oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver | grep encryption
+
+# Create test secret and check
+oc create secret generic test-check --from-literal=foo=bar
+oc get secret test-check -o yaml
+```
+
+**Solution**:
+1. Verify `--encryption-provider-config` flag is present in API server command
+2. Verify encryption config mounts are correct
+3. Restart API server pods if needed
+
+### Issue: Can't Access Secrets After Enabling Encryption
+
+**Symptoms**: Secrets become unreadable
+
+**Cause**: Encryption config may be using KMS-only without fallback
+
+**Solution**: Ensure `identity: {}` provider is listed after KMS provider in encryption config
+
+---
+
+## Rollback Procedure
+
+If you need to revert all changes:
+
+### Step 1: Remove Encryption Configuration
 
 ```bash
-# Remove encryption configuration
-for node in $(oc get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}'); do
-  oc debug node/$node -- chroot /host bash -c '
-    # Restore backups
-    cp /etc/kubernetes/manifests/kube-apiserver-pod.yaml.backup /etc/kubernetes/manifests/kube-apiserver-pod.yaml 2>/dev/null || true
+for node in $(oc get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}'); do
+  echo "Restoring configuration on node: $node"
 
-    # Remove KMS plugin static pod
-    rm /etc/kubernetes/manifests/kms-plugin.yaml 2>/dev/null || true
+  oc debug node/$node -- chroot /host bash -c '
+    # Restore original kube-apiserver manifest
+    if [ -f /etc/kubernetes/manifests/kube-apiserver-pod.yaml.backup ]; then
+      cp /etc/kubernetes/manifests/kube-apiserver-pod.yaml.backup \
+         /etc/kubernetes/manifests/kube-apiserver-pod.yaml
+    fi
+
+    # Remove KMS plugin static pod (if using static pods)
+    rm -f /etc/kubernetes/manifests/kms-plugin.yaml
 
     # Remove encryption config
-    rm -rf /etc/kubernetes/encryption-config 2>/dev/null || true
+    rm -rf /etc/kubernetes/encryption-config
   '
 done
+```
 
-# Scale operators back up
-oc scale deployment kube-apiserver-operator -n openshift-kube-apiserver-operator --replicas=1
-oc scale deployment openshift-apiserver-operator -n openshift-apiserver-operator --replicas=1
-oc scale deployment authentication-operator -n openshift-authentication-operator --replicas=1
+### Step 2: Remove KMS Plugin DaemonSet
 
-# Mark operators as Managed again
-oc patch kubeapiserver cluster --type=merge -p '{"spec":{"managementState":"Managed"}}'
-oc patch openshiftapiserver cluster --type=merge -p '{"spec":{"managementState":"Managed"}}'
-oc patch authentication cluster --type=merge -p '{"spec":{"managementState":"Managed"}}'
+```bash
+# If using DaemonSet
+oc delete daemonset vault-kms-plugin -n openshift-kube-apiserver
+
+# Delete credentials secret
+oc delete secret vault-kms-credentials -n openshift-kube-apiserver
+```
+
+### Step 3: Scale Operators Back Up
+
+```bash
+oc scale deployment/kube-apiserver-operator \
+  -n openshift-kube-apiserver-operator --replicas=1
+
+oc scale deployment/authentication-operator \
+  -n openshift-authentication-operator --replicas=1
+```
+
+### Step 4: Verify Cluster is Healthy
+
+```bash
+# Check cluster operators
+oc get clusteroperators
+
+# All should show AVAILABLE=True, PROGRESSING=False, DEGRADED=False
 ```
 
 ---
 
 ## Important Notes
 
-1. **Testing Environment**: These steps should only be performed on test/development clusters, not production
-2. **Backup**: Always backup your cluster configuration before making these changes
-3. **Static Pods**: Changes to static pod manifests in `/etc/kubernetes/manifests/` are automatically detected by kubelet
-4. **Socket Path**: Ensure the KMS plugin socket path matches the path in the encryption configuration
-5. **Permissions**: The KMS plugin must have appropriate permissions to access the KMS service (e.g., Vault tokens)
-6. **Network**: Ensure network connectivity between API servers and the KMS service
-7. **High Availability**: The KMS plugin should be available on all control plane nodes for HA
+### Critical Considerations
+
+1. **Socket Path Consistency**: The socket path must match exactly between:
+   - KMS plugin `--listen` flag
+   - Encryption config `endpoint`
+   - Volume mount paths
+
+2. **All Control Plane Nodes**: Changes must be applied to ALL control plane nodes for HA
+
+3. **Backup Everything**: Always maintain backups of:
+   - API server manifests
+   - Encryption configurations
+   - KMS credentials
+
+4. **Testing Only**: This procedure is for test/dev clusters only
+
+5. **Operators**: Once operators are scaled back up, they may revert your manual changes unless properly configured
+
+### Security Best Practices
+
+1. **Credentials**: Store Vault credentials securely in Kubernetes secrets
+2. **RBAC**: Limit access to KMS plugin credentials
+3. **Network**: Use network policies to restrict access to KMS plugin
+4. **Audit**: Enable audit logging to track encryption events
+5. **Rotation**: Implement regular credential rotation
 
 ---
 
 ## Additional Resources
 
 - [Kubernetes Encryption at Rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/)
-- [KMS Plugin Documentation](https://kubernetes.io/docs/tasks/administer-cluster/kms-provider/)
-- [OpenShift API Server Configuration](https://docs.openshift.com/container-platform/latest/security/encrypting-etcd.html)
+- [KMS Provider Documentation](https://kubernetes.io/docs/tasks/administer-cluster/kms-provider/)
+- [OpenShift etcd Encryption](https://docs.openshift.com/container-platform/latest/security/encrypting-etcd.html)
+- [HashiCorp Vault Transit Engine](https://developer.hashicorp.com/vault/docs/secrets/transit)
 
 ---
 
 ## Support
 
-For issues specific to the KMS plugin implementation, contact your KMS provider (e.g., HashiCorp for Vault KMS plugin).
-
-For OpenShift-specific issues, refer to Red Hat support or OpenShift documentation.
+- For Vault-specific issues: [HashiCorp Vault Community](https://discuss.hashicorp.com/c/vault)
+- For OpenShift issues: [Red Hat Support](https://access.redhat.com/support)
+- For this guide: Check the repository issues page

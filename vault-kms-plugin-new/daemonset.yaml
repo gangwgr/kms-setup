@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vault-kube-kms
+  namespace: openshift-kms-plugin
+  labels:
+    app: vault-kube-kms
+spec:
+  selector:
+    matchLabels:
+      app: vault-kube-kms
+  template:
+    metadata:
+      labels:
+        app: vault-kube-kms
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - operator: Exists
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      serviceAccountName: vault-kms-plugin
+      imagePullSecrets:
+      - name: quay-pull-secret
+      containers:
+      - name: vault-kube-kms
+        # Use private image from Quay.io
+        image: quay.io/rhn_support_rgangwar/vault-kube-kms:latest
+        imagePullPolicy: Always
+        command:
+        - /bin/sh
+        - -c
+        args:
+        - |
+          echo "$VAULT_SECRET_ID" > /tmp/secret-id
+          exec /vault-kube-kms \
+            -listen-address=unix:///var/run/kmsplugin/kms.sock \
+            -vault-address=$VAULT_ADDR \
+            -vault-namespace=$VAULT_NAMESPACE \
+            -transit-mount=transit \
+            -transit-key=$VAULT_KEY_NAME \
+            -skip-tls-verify \
+            -approle-role-id=$VAULT_ROLE_ID \
+            -approle-secret-id-path=/tmp/secret-id
+        env:
+        - name: VAULT_ROLE_ID
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: VAULT_ROLE_ID
+        - name: VAULT_SECRET_ID
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: VAULT_SECRET_ID
+        - name: VAULT_ADDR
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: VAULT_ADDR
+        - name: VAULT_NAMESPACE
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: VAULT_NAMESPACE
+        - name: VAULT_KEY_NAME
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: VAULT_KEY_NAME
+        volumeMounts:
+        - name: kmsplugin
+          mountPath: /var/run/kmsplugin
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          privileged: true
+      volumes:
+      - name: kmsplugin
+        hostPath:
+          path: /var/run/kmsplugin
+          type: DirectoryOrCreate

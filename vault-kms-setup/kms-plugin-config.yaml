@@ -14,5 +14,5 @@ stringData:
       auth:
         type: "approle"
         approle:
-          roleID: "577c005a-d039-693c-a896-47158ff796af"
-          secretID: "69a4d9e3-ed31-440e-4a3f-7783ee78ea0b"
+          roleID: "50e11260-b920-6ea6-a929-0c410e34b4d8"
+          secretID: "2ae4c3b7-c268-cc34-c367-bc69daae7e43"
