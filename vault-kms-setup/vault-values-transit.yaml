@@ -1,0 +1,24 @@
+global:
+  openshift: true
+
+server:
+  image:
+    repository: "docker.io/hashicorp/vault"
+    tag: "1.16.1"
+
+  dev:
+    enabled: true
+    devRootToken: "root"
+
+  standalone:
+    enabled: false
+
+  dataStorage:
+    enabled: false
+
+injector:
+  enabled: false
+
+ui:
+  enabled: true
+  serviceType: ClusterIP
