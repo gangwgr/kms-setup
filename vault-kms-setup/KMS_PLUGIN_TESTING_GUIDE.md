@@ -105,7 +105,7 @@ spec:
         image: registry.k8s.io/kms/vault:v0.9.0
         args:
         - --debug
-        - --listen=/var/run/kmsplugin/socket.sock
+        - --listen=/var/run/kmsplugin/kms.sock
         - --vault-address=http://vault.vault.svc.cluster.local:8200
         - --vault-transit-path=transit
         - --vault-transit-key=kubernetes-encryption
@@ -130,7 +130,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - test -S /var/run/kmsplugin/socket.sock
+            - test -S /var/run/kmsplugin/kms.sock
           initialDelaySeconds: 15
           periodSeconds: 30
       hostNetwork: true
@@ -183,7 +183,7 @@ spec:
     command:
     - /kms-plugin
     args:
-    - --listen=/var/run/kmsplugin/socket.sock
+    - --listen=/var/run/kmsplugin/kms.sock
     - --vault-address=http://vault.vault.svc.cluster.local:8200
     - --vault-transit-path=transit
     - --vault-transit-key=kubernetes-encryption
@@ -355,7 +355,7 @@ oc logs -n openshift-kube-apiserver -l name=vault-kms-plugin --tail=50
 # Check that socket exists on each control plane node
 for node in $(oc get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}'); do
   echo "Checking socket on node: $node"
-  oc debug node/$node -- chroot /host ls -la /var/run/kmsplugin/socket.sock
+  oc debug node/$node -- chroot /host ls -la /var/run/kmsplugin/kms.sock
 done
 ```
 
@@ -473,7 +473,7 @@ oc debug node/<node> -- chroot /host journalctl -u kubelet -n 100
 
 **Solution**:
 1. Verify encryption config exists: `/etc/kubernetes/encryption-config/encryption-config.yaml`
-2. Verify KMS socket exists: `/var/run/kmsplugin/socket.sock`
+2. Verify KMS socket exists: `/var/run/kmsplugin/kms.sock`
 3. Check KMS plugin is running and healthy
 
 ### Issue: KMS Plugin Not Responding
