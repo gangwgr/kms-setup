@@ -220,7 +220,7 @@ resources:
     providers:
       - kms:
           name: vault-kms
-          endpoint: unix:///var/run/kmsplugin/socket.sock
+          endpoint: unix:///var/run/kmsplugin/kms.sock
           cachesize: 1000
           timeout: 3s
       - identity: {}
@@ -271,7 +271,7 @@ resources:
     providers:
       - kms:
           name: vault-kms
-          endpoint: unix:///var/run/kmsplugin/socket.sock
+          endpoint: unix:///var/run/kmsplugin/kms.sock
           cachesize: 1000
           timeout: 3s
       - identity: {}
