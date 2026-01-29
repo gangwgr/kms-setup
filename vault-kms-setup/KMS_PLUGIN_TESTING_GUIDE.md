@@ -67,6 +67,37 @@ authentication-operator   0/0     0            0           XXm
 openshift-apiserver-operator   0/0     0            0           XXm
 ```
 
+## If still see pods are not coming down use below then repeat above steps
+```bash
+oc patch clusterversion version --type=merge -p '
+{
+  "spec": {
+    "overrides": [
+      {
+        "kind": "Deployment",
+        "group": "apps",
+        "name": "kube-apiserver-operator",
+        "namespace": "openshift-kube-apiserver-operator",
+        "unmanaged": true
+      },
+      {
+        "kind": "Deployment",
+        "group": "apps",
+        "name": "authentication-operator",
+        "namespace": "openshift-authentication-operator",
+        "unmanaged": true
+      },
+      {
+        "kind": "Deployment",
+        "group": "apps",
+        "name": "openshift-apiserver-operator",
+        "namespace": "openshift-apiserver-operator",
+        "unmanaged": true
+      }
+    ]
+  }
+}'
+```
 ---
 
 ## Step 2: Deploy KMS Plugin
