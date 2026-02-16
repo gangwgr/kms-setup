@@ -277,7 +277,7 @@ oc logs -n openshift-kms-plugin -l app=vault-kube-kms
 
 ### Vault Connection Issues
 
-1. **For local Vault:** Ensure the secret uses ClusterIP, not DNS name (KMS plugin runs with hostNetwork)
+1. **For local Vault:** Use the ClusterIP address (not DNS name) since Pod DNS resolution may vary
 2. **For cloud Vault:** Ensure the Vault address is accessible from control-plane nodes
 3. Check AppRole credentials are valid
 

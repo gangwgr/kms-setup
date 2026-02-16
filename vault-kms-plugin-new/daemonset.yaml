@@ -18,7 +18,8 @@ spec:
         node-role.kubernetes.io/control-plane: ""
       tolerations:
       - operator: Exists
-      hostNetwork: true
+      # Note: hostNetwork is NOT needed - KMS plugin communicates via Unix socket
+      # mounted as hostPath, not over the network
       priorityClassName: system-node-critical
       serviceAccountName: vault-kms-plugin
       imagePullSecrets:
