@@ -41,7 +41,7 @@ spec:
             -vault-namespace=$VAULT_NAMESPACE \
             -transit-mount=transit \
             -transit-key=$VAULT_KEY_NAME \
-            -skip-tls-verify \
+            -log-level=debug-extended \
             -approle-role-id=$VAULT_ROLE_ID \
             -approle-secret-id-path=/tmp/secret-id
         env:
