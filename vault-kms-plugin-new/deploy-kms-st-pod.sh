@@ -364,16 +364,31 @@ authenticate_vault() {
         echo "Using provided token"
     elif [ -n "$VAULT_USERNAME" ] && [ -n "$VAULT_PASSWORD" ]; then
         echo "Authenticating with userpass..."
-        local ns_header=""
-        [ -n "$VAULT_NAMESPACE" ] && ns_header="--header X-Vault-Namespace:$VAULT_NAMESPACE"
-        
-        VAULT_TOKEN=$(curl -sf --noproxy "*" $ns_header \
+        local tls_flag=""
+        [ "$SKIP_TLS_VERIFY" = "true" ] && tls_flag="-k"
+
+        local -a ns_args=()
+        [ -n "$VAULT_NAMESPACE" ] && ns_args=("--header" "X-Vault-Namespace: $VAULT_NAMESPACE")
+
+        local auth_resp http_code
+        auth_resp=$(curl -s --noproxy "*" --max-time 15 $tls_flag \
+            "${ns_args[@]}" \
+            -w "\n%{http_code}" \
             --request POST \
             --data "{\"password\": \"$VAULT_PASSWORD\"}" \
-            "$VAULT_ADDR/v1/auth/userpass/login/$VAULT_USERNAME" | jq -r '.auth.client_token')
+            "$VAULT_ADDR/v1/auth/userpass/login/$VAULT_USERNAME" 2>&1) || true
+
+        http_code=$(echo "$auth_resp" | tail -n1)
+        auth_resp=$(echo "$auth_resp" | sed '$d')
+
+        VAULT_TOKEN=$(echo "$auth_resp" | jq -r '.auth.client_token // empty' 2>/dev/null)
         
-        if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
-            echo -e "${RED}Error: Failed to authenticate${NC}"
+        if [ -z "$VAULT_TOKEN" ]; then
+            echo -e "${RED}Error: Failed to authenticate (HTTP $http_code)${NC}"
+            echo "  Vault address:  $VAULT_ADDR"
+            echo "  Username:       $VAULT_USERNAME"
+            echo "  Namespace:      ${VAULT_NAMESPACE:-(none)}"
+            echo "  Response: $(echo "$auth_resp" | jq -r '.errors[]?' 2>/dev/null || echo "$auth_resp")"
             exit 1
         fi
     else
@@ -765,7 +780,8 @@ configure_global_pull_secret() {
     oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > /tmp/global-pull-secret.json
 
     # Create Quay.io auth string
-    QUAY_AUTH=$(echo -n "$QUAY_USERNAME:$QUAY_PASSWORD" | base64 -w 0)
+    # Note: macOS base64 doesn't support -w 0, use -b 0 or pipe through tr
+    QUAY_AUTH=$(printf '%s' "$QUAY_USERNAME:$QUAY_PASSWORD" | base64 | tr -d '\n')
 
     # Merge with existing pull secret using jq
     jq ".auths += {\"quay.io\": {\"auth\": \"$QUAY_AUTH\"}}" /tmp/global-pull-secret.json > /tmp/merged-pull-secret.json
@@ -773,18 +789,35 @@ configure_global_pull_secret() {
     # Update the global pull secret
     oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/tmp/merged-pull-secret.json
 
+    # Verify the update
+    echo "    Verifying quay.io entry in global pull secret..."
+    if oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d | jq -e '.auths["quay.io"]' >/dev/null 2>&1; then
+        echo "    ✓ quay.io credentials added to global pull secret"
+    else
+        echo -e "${RED}    ✗ WARNING: quay.io entry NOT found in global pull secret after update${NC}"
+        echo "    The pull secret update may have failed. Check manually:"
+        echo "    oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\\.dockerconfigjson}' | base64 -d | jq '.auths | keys'"
+    fi
+
     # Clean up
     rm -f /tmp/global-pull-secret.json /tmp/merged-pull-secret.json
 
     echo "    Global pull secret updated"
-    echo "    Note: Nodes will automatically restart to pick up new credentials"
-    echo "    Waiting for nodes to pick up changes..."
+    echo "    Note: Nodes need time to pick up new credentials"
+    echo "    MachineConfigPool will roll out changes to each node (takes 10-20 minutes)"
+    echo "    Monitor with: oc get mcp"
+    echo "    Waiting for initial propagation..."
 
-    # Wait longer for the pull secret to propagate to nodes
+    # Wait for the pull secret to begin propagating
     for i in {1..6}; do
         echo "    Waiting... ($i/6)"
         sleep 10
     done
+
+    # Show MachineConfigPool status
+    echo ""
+    echo "    MachineConfigPool status:"
+    oc get mcp --no-headers 2>/dev/null || true
 }
 
 #######################################
@@ -893,7 +926,8 @@ EOF
         echo "  Deploying static pod to node: $node"
 
         # Create base64 encoded manifest to avoid shell escaping issues
-        MANIFEST_B64=$(cat /tmp/vault-kube-kms-static.yaml | base64 -w 0)
+        # Note: macOS base64 doesn't support -w 0, use tr -d to strip newlines
+        MANIFEST_B64=$(cat /tmp/vault-kube-kms-static.yaml | base64 | tr -d '\n')
 
         # Deploy using oc debug node with base64 encoding
         echo "    Copying manifest to $node:/etc/kubernetes/manifests/"
