@@ -52,6 +52,8 @@ SKIP_TLS_VERIFY="false"
 DEPLOY_TYPE=""  # "static-pod" or "daemonset"; auto-selected if not specified
 QUAY_USERNAME="${QUAY_USERNAME:-}"
 QUAY_PASSWORD="${QUAY_PASSWORD:-}"
+TRANSIT_MOUNT="${TRANSIT_MOUNT:-transit}"
+KMS_IMAGE="${KMS_IMAGE:-quay.io/rhn_support_rgangwar/vault-kube-kms:latest}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -88,6 +90,14 @@ while [[ $# -gt 0 ]]; do
             SKIP_TLS_VERIFY="true"
             shift
             ;;
+        --transit-mount)
+            TRANSIT_MOUNT="$2"
+            shift 2
+            ;;
+        --kms-image)
+            KMS_IMAGE="$2"
+            shift 2
+            ;;
         --static-pod)
             DEPLOY_TYPE="static-pod"
             shift
@@ -115,10 +125,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --username          Vault username for userpass auth"
             echo "  --password          Vault password for userpass auth"
             echo "  --skip-tls-verify   Skip TLS verification"
+            echo "  --transit-mount     Transit secrets engine mount path (default: transit)"
+            echo "  --kms-image         KMS plugin container image (default: quay.io/rhn_support_rgangwar/vault-kube-kms:latest)"
             echo ""
             echo "Environment variables:"
             echo "  VAULT_ADDR, VAULT_NAMESPACE, VAULT_TOKEN"
             echo "  VAULT_USERNAME, VAULT_PASSWORD"
+            echo "  TRANSIT_MOUNT, KMS_IMAGE"
             echo ""
             echo "Examples:"
             echo "  # Cloud Vault with static pod deployment:"
@@ -398,6 +411,66 @@ authenticate_vault() {
     fi
     
     echo -e "${GREEN}Authentication successful${NC}"
+}
+
+#######################################
+# Verify Vault Enterprise
+# The latest vault-kube-kms build strictly
+# validates that Vault is Enterprise edition.
+#######################################
+verify_vault_enterprise() {
+    echo -e "${YELLOW}Verifying Vault Enterprise...${NC}"
+
+    local tls_flag=""
+    [ "$SKIP_TLS_VERIFY" = "true" ] && tls_flag="-k"
+
+    local -a ns_args=()
+    [ -n "$VAULT_NAMESPACE" ] && ns_args=("--header" "X-Vault-Namespace: $VAULT_NAMESPACE")
+
+    local health_resp
+    health_resp=$(curl -s --noproxy "*" --max-time 10 $tls_flag \
+        "${ns_args[@]}" \
+        "$VAULT_ADDR/v1/sys/health" 2>/dev/null || echo "{}")
+
+    local vault_version
+    vault_version=$(echo "$health_resp" | jq -r '.version // empty' 2>/dev/null || echo "")
+
+    if [ -n "$vault_version" ]; then
+        echo "  Vault version: $vault_version"
+        if echo "$vault_version" | grep -qiE '\+ent|\+prem|\.ent'; then
+            echo -e "${GREEN}  ✓ Vault Enterprise confirmed${NC}"
+            return 0
+        fi
+    fi
+
+    # Fallback: try license endpoint (Enterprise-only)
+    local license_code
+    license_code=$(curl -s -o /dev/null -w "%{http_code}" --noproxy "*" --max-time 10 $tls_flag \
+        --header "X-Vault-Token: $VAULT_TOKEN" \
+        "${ns_args[@]}" \
+        "$VAULT_ADDR/v1/sys/license/status" 2>/dev/null || echo "000")
+
+    if [ "$license_code" = "200" ]; then
+        echo -e "${GREEN}  ✓ Vault Enterprise confirmed (license endpoint available)${NC}"
+        return 0
+    fi
+
+    # HCP Vault is always Enterprise but health endpoint may not return version with namespace
+    if echo "$VAULT_ADDR" | grep -qi "hashicorp.cloud"; then
+        echo -e "${GREEN}  ✓ HCP Vault detected (Enterprise)${NC}"
+        return 0
+    fi
+
+    echo -e "${RED}  ✗ Could not confirm Vault Enterprise${NC}"
+    echo "    The latest vault-kube-kms build requires Vault Enterprise."
+    echo "    Version detected: ${vault_version:-unknown}"
+    echo ""
+    echo "    If you are using HCP Vault or Vault Enterprise, this may be a false alarm."
+    read -p "    Continue anyway? [y/N]: " continue_anyway
+    if [ "$continue_anyway" != "y" ] && [ "$continue_anyway" != "Y" ]; then
+        echo "Aborting. Please use Vault Enterprise."
+        exit 1
+    fi
 }
 
 #######################################
@@ -750,6 +823,7 @@ stringData:
   VAULT_ROLE_ID: "$ROLE_ID"
   VAULT_SECRET_ID: "$SECRET_ID"
   VAULT_KEY_NAME: "kms-key"
+  TRANSIT_MOUNT: "$TRANSIT_MOUNT"
 EOF
 
     # Update daemonset for skip-tls if needed
@@ -859,7 +933,7 @@ spec:
   priorityClassName: system-node-critical
   containers:
   - name: vault-kube-kms
-    image: quay.io/rhn_support_rgangwar/vault-kube-kms:latest
+    image: PLACEHOLDER_KMS_IMAGE
     imagePullPolicy: Always
     command:
     - /bin/sh
@@ -871,12 +945,16 @@ spec:
         -listen-address=unix:///var/run/kmsplugin/kms.sock \
         -vault-address=$VAULT_ADDR \
         -vault-namespace=$VAULT_NAMESPACE \
-        -transit-mount=transit \
+        -transit-mount=$TRANSIT_MOUNT \
         -transit-key=$VAULT_KEY_NAME \
         -log-level=debug-extended \
         -approle-role-id=$VAULT_ROLE_ID \
         -approle-secret-id-path=/tmp/secret-id
 STATICPODEOF
+
+    # Substitute image placeholder
+    sed -i.bak "s|PLACEHOLDER_KMS_IMAGE|$KMS_IMAGE|g" /tmp/vault-kube-kms-static.yaml
+    rm -f /tmp/vault-kube-kms-static.yaml.bak
 
     # Append environment variables with actual values
     cat >> /tmp/vault-kube-kms-static.yaml <<EOF
@@ -891,6 +969,8 @@ STATICPODEOF
       value: "$VAULT_NAMESPACE"
     - name: VAULT_KEY_NAME
       value: "kms-key"
+    - name: TRANSIT_MOUNT
+      value: "$TRANSIT_MOUNT"
     volumeMounts:
     - name: kmsplugin
       mountPath: /var/run/kmsplugin
@@ -1089,6 +1169,19 @@ main() {
     command -v curl >/dev/null 2>&1 || { echo "Error: curl is required"; exit 1; }
     
     if [ "$MODE" = "local" ]; then
+        echo -e "${RED}╔═══════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║  WARNING: The latest vault-kube-kms build requires       ║${NC}"
+        echo -e "${RED}║  Vault Enterprise. Local (community) Vault will NOT      ║${NC}"
+        echo -e "${RED}║  work — the plugin will refuse to start.                 ║${NC}"
+        echo -e "${RED}║                                                          ║${NC}"
+        echo -e "${RED}║  Use --cloud with HCP Vault or Vault Enterprise instead. ║${NC}"
+        echo -e "${RED}╚═══════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        read -p "Continue with local (community) Vault anyway? [y/N]: " local_continue
+        if [ "$local_continue" != "y" ] && [ "$local_continue" != "Y" ]; then
+            echo "Aborting. Use --cloud with Vault Enterprise."
+            exit 1
+        fi
         install_local_vault
     else
         # Cloud mode - collect Vault details
@@ -1136,6 +1229,8 @@ main() {
         fi
         authenticate_vault
     fi
+
+    verify_vault_enterprise
     
     configure_vault
 

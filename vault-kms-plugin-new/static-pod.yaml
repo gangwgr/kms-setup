@@ -27,8 +27,8 @@ spec:
   # Static pods don't use serviceAccountName - they run with kubelet's permissions
   containers:
   - name: vault-kube-kms
-    # Use private image from Quay.io
-    image: quay.io/rhn_support_rgangwar/vault-kube-kms:latest
+    # Replace with latest vault-kube-kms image (must be Vault Enterprise compatible)
+    image: PLACEHOLDER_KMS_IMAGE
     imagePullPolicy: Always
     command:
     - /bin/sh
@@ -40,7 +40,7 @@ spec:
         -listen-address=unix:///var/run/kmsplugin/kms.sock \
         -vault-address=$VAULT_ADDR \
         -vault-namespace=$VAULT_NAMESPACE \
-        -transit-mount=transit \
+        -transit-mount=$TRANSIT_MOUNT \
         -transit-key=$VAULT_KEY_NAME \
         -log-level=debug-extended \
         -approle-role-id=$VAULT_ROLE_ID \
@@ -57,6 +57,8 @@ spec:
       value: "PLACEHOLDER_VAULT_NAMESPACE"
     - name: VAULT_KEY_NAME
       value: "kms-key"
+    - name: TRANSIT_MOUNT
+      value: "PLACEHOLDER_TRANSIT_MOUNT"
     volumeMounts:
     - name: kmsplugin
       mountPath: /var/run/kmsplugin

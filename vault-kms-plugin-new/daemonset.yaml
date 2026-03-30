@@ -26,7 +26,7 @@ spec:
       - name: quay-pull-secret
       containers:
       - name: vault-kube-kms
-        # Use private image from Quay.io
+        # Replace with latest vault-kube-kms image (must be Vault Enterprise compatible)
         image: quay.io/rhn_support_rgangwar/vault-kube-kms:latest
         imagePullPolicy: Always
         command:
@@ -39,7 +39,7 @@ spec:
             -listen-address=unix:///var/run/kmsplugin/kms.sock \
             -vault-address=$VAULT_ADDR \
             -vault-namespace=$VAULT_NAMESPACE \
-            -transit-mount=transit \
+            -transit-mount=$TRANSIT_MOUNT \
             -transit-key=$VAULT_KEY_NAME \
             -log-level=debug-extended \
             -approle-role-id=$VAULT_ROLE_ID \
@@ -70,6 +70,11 @@ spec:
             secretKeyRef:
               name: vault-kms-credentials
               key: VAULT_KEY_NAME
+        - name: TRANSIT_MOUNT
+          valueFrom:
+            secretKeyRef:
+              name: vault-kms-credentials
+              key: TRANSIT_MOUNT
         volumeMounts:
         - name: kmsplugin
           mountPath: /var/run/kmsplugin
