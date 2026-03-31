@@ -51,7 +51,7 @@ func main() {
 	keyId, err := GenerateKMSKeyId(configv1.KMSConfig{
 		Type: configv1.AWSKMSProvider,
 		AWS: &configv1.AWSKMSConfig{
-			KeyARN: "arn:aws:kms:us-east-2:301721915996:key/cfa1c070-100c-4b48-afe2-b916f31a525c",
+			KeyARN: "xxxx",
 			Region: "us-east-2",
 		},
 	})

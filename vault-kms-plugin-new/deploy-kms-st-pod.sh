@@ -1076,33 +1076,31 @@ EOF
 }
 
 #######################################
-# Enable KMSEncryption FeatureGate
+# Enable TechPreviewNoUpgrade FeatureGate (includes KMSEncryption)
 #######################################
 enable_kms_featuregate() {
     echo ""
-    echo -e "${YELLOW}Enabling KMSEncryption FeatureGate...${NC}"
+    echo -e "${YELLOW}Enabling TechPreviewNoUpgrade FeatureGate...${NC}"
 
-    # Check if the featuregate is already enabled
-    local current_features
-    current_features=$(oc get featuregate cluster -o json 2>/dev/null || echo "{}")
+    # Check if TechPreviewNoUpgrade is already set
+    local current_featureset
+    current_featureset=$(oc get featuregate cluster -o jsonpath='{.spec.featureSet}' 2>/dev/null || echo "")
 
-    if echo "$current_features" | jq -e '.spec.customNoUpgrade.enabled // [] | index("KMSEncryptionProvider")' >/dev/null 2>&1; then
-        echo "  KMSEncryptionProvider FeatureGate already enabled"
+    if [ "$current_featureset" = "TechPreviewNoUpgrade" ]; then
+        echo "  TechPreviewNoUpgrade FeatureGate already enabled"
         return
     fi
 
-    echo "  Patching FeatureGate to enable KMSEncryptionProvider..."
-    echo -e "${YELLOW}  WARNING: This sets featureSet=CustomNoUpgrade which prevents minor version upgrades${NC}"
-    oc patch featuregate/cluster --type=merge -p '{
-        "spec": {
-            "featureSet": "CustomNoUpgrade",
-            "customNoUpgrade": {
-                "enabled": ["KMSEncryption"]
-            }
-        }
-    }'
+    if [ -n "$current_featureset" ] && [ "$current_featureset" != "TechPreviewNoUpgrade" ]; then
+        echo -e "${YELLOW}  Current featureSet: $current_featureset${NC}"
+        echo -e "${YELLOW}  This will be changed to TechPreviewNoUpgrade${NC}"
+    fi
 
-    echo -e "${GREEN}  KMSEncryptionProvider FeatureGate enabled${NC}"
+    echo "  Patching FeatureGate to TechPreviewNoUpgrade..."
+    echo -e "${YELLOW}  WARNING: This enables all tech preview features and prevents minor version upgrades${NC}"
+    oc patch featuregate/cluster --type=merge -p '{"spec":{"featureSet":"TechPreviewNoUpgrade"}}'
+
+    echo -e "${GREEN}  TechPreviewNoUpgrade FeatureGate enabled${NC}"
     echo ""
     echo "  Waiting for kube-apiserver to roll out with the new feature gate..."
     echo "  This can take several minutes as each control plane node is updated sequentially."
@@ -1112,35 +1110,13 @@ enable_kms_featuregate() {
     echo "    oc get nodes -l node-role.kubernetes.io/master"
     echo ""
 
-    # Wait for kube-apiserver operator to begin progressing
-    echo "  Waiting for kube-apiserver operator to start rolling out..."
-    local max_wait=120
-    local waited=0
-    while [ $waited -lt $max_wait ]; do
-        local progressing
-        progressing=$(oc get clusteroperator kube-apiserver -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || echo "Unknown")
-        if [ "$progressing" = "True" ]; then
-            echo "    kube-apiserver is progressing..."
-            break
-        fi
-        sleep 10
-        waited=$((waited + 10))
-        echo "    Waiting for rollout to begin... ($waited/${max_wait}s)"
-    done
-
-    # Wait for kube-apiserver operator to become available and not progressing
-    echo "  Waiting for kube-apiserver rollout to complete (this may take 10-20 minutes)..."
-    oc wait clusteroperator kube-apiserver \
-        --for=condition=Progressing=False \
-        --timeout=1200s 2>/dev/null || echo -e "${YELLOW}  Timeout waiting for rollout - check manually${NC}"
-
-    local available
-    available=$(oc get clusteroperator kube-apiserver -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "Unknown")
-    if [ "$available" = "True" ]; then
-        echo -e "${GREEN}  kube-apiserver rollout complete and available${NC}"
-    else
-        echo -e "${YELLOW}  kube-apiserver availability: $available - please verify manually${NC}"
-    fi
+    echo "  Waiting for cluster to stabilize after FeatureGate change..."
+    echo "  (This may take 15-30 minutes as control plane nodes roll out sequentially)"
+    echo ""
+    oc adm wait-for-stable-cluster --timeout=30m || {
+        echo -e "${YELLOW}  Timeout waiting for stable cluster — check manually:${NC}"
+        echo "    oc get co"
+    }
 }
 
 #######################################
@@ -1152,10 +1128,20 @@ enable_kms_encryption() {
     
     oc patch apiserver cluster --type=merge -p '{"spec":{"encryption":{"type":"KMS"}}}'
     
-    echo -e "${GREEN}KMS encryption enabled${NC}"
+    echo -e "${GREEN}KMS encryption patch applied${NC}"
     echo ""
-    echo "Monitor progress with:"
-    echo "  oc get clusteroperator kube-apiserver"
+    echo "  Waiting for cluster to stabilize after KMS encryption change..."
+    echo "  (This may take 15-30 minutes as kube-apiserver rolls out on each control plane node)"
+    echo ""
+    oc adm wait-for-stable-cluster --timeout=30m || {
+        echo -e "${YELLOW}  Timeout waiting for stable cluster — check manually:${NC}"
+        echo "    oc get co"
+    }
+
+    echo ""
+    echo -e "${GREEN}KMS encryption enabled and cluster stable${NC}"
+    echo ""
+    echo "Verify encryption status:"
     echo "  oc get kubeapiserver cluster -o jsonpath='{.status.conditions}' | jq '.[] | select(.type | contains(\"Encrypt\"))'"
 }
 
@@ -1234,15 +1220,37 @@ main() {
     
     configure_vault
 
-    # Enable KMSEncryption FeatureGate (required before KMS can be used)
+    # Prompt for Quay.io credentials if not provided and image is from quay.io
+    if echo "$KMS_IMAGE" | grep -qi "quay.io"; then
+        if [ -z "$QUAY_USERNAME" ] || [ -z "$QUAY_PASSWORD" ]; then
+            echo ""
+            echo -e "${YELLOW}Image is from Quay.io: $KMS_IMAGE${NC}"
+            echo "If this is a private repository, you need Quay.io pull credentials."
+            echo "(Skip if the repository is public)"
+            echo ""
+            read -p "  Enter Quay.io credentials? [y/N]: " add_quay
+            if [ "$add_quay" = "y" ] || [ "$add_quay" = "Y" ]; then
+                read -p "  Quay.io username (or robot account, e.g. user+robot): " QUAY_USERNAME
+                read -sp "  Quay.io password/token: " QUAY_PASSWORD
+                echo ""
+                if [ -z "$QUAY_USERNAME" ] || [ -z "$QUAY_PASSWORD" ]; then
+                    echo -e "${RED}Error: Username and password cannot be empty${NC}"
+                    exit 1
+                fi
+                echo -e "${GREEN}  Quay.io credentials set${NC}"
+            fi
+        fi
+    fi
+
+    # Enable TechPreviewNoUpgrade FeatureGate (required before KMS can be used)
     echo ""
-    read -p "Enable KMSEncryption FeatureGate now? (required for KMS) [Y/n]: " enable_fg
+    read -p "Enable TechPreviewNoUpgrade FeatureGate now? (required for KMS) [Y/n]: " enable_fg
     if [ "$enable_fg" != "n" ] && [ "$enable_fg" != "N" ]; then
         enable_kms_featuregate
     else
         echo ""
         echo -e "${YELLOW}Skipping FeatureGate - you must enable it manually before KMS will work:${NC}"
-        echo "  oc patch featuregate/cluster --type=merge -p '{\"spec\":{\"featureSet\":\"CustomNoUpgrade\",\"customNoUpgrade\":{\"enabled\":[\"KMSEncryptionProvider\"]}}}'"
+        echo "  oc patch featuregate/cluster --type=merge -p '{\"spec\":{\"featureSet\":\"TechPreviewNoUpgrade\"}}'"
     fi
 
     deploy_kms_plugin

@@ -170,6 +170,9 @@ clone_and_checkout() {
     if [ -d "$CLONE_DIR/.git" ]; then
         log_info "Repo already exists at $CLONE_DIR, updating..."
         cd "$CLONE_DIR"
+        # Switch to main/default branch before fetching to avoid "refusing to fetch into checked out branch"
+        git checkout main 2>/dev/null || git checkout -b tmp-branch 2>/dev/null || true
+        git branch -D "pr-$PR_NUMBER" 2>/dev/null || true
         git fetch origin 2>/dev/null || true
     else
         log_info "Cloning openshift/hypershift to $CLONE_DIR..."

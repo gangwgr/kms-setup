@@ -98,6 +98,10 @@ cleanup() {
         kill "$PF_PID" 2>/dev/null || true
         wait "$PF_PID" 2>/dev/null || true
     fi
+    # Clean up in-cluster TLS probe pod
+    if [ -n "${TLS_TEST_POD:-}" ]; then
+        oc delete pod -n "${OPERATOR_NS:-hypershift}" "$TLS_TEST_POD" --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
@@ -276,25 +280,42 @@ start_port_forward() {
         return 1
     fi
 
-    log_info "Port-forwarding to $pod_name:9443 → localhost:$LOCAL_PORT"
-    oc port-forward -n "$OPERATOR_NS" "pod/$pod_name" "${LOCAL_PORT}:9443" >/dev/null 2>&1 &
-    PF_PID=$!
-
-    # Wait and retry if needed
     local attempt=0
     while [ "$attempt" -lt 3 ]; do
-        sleep 3
-        if kill -0 "$PF_PID" 2>/dev/null; then
-            log_pass "Port-forward active (PID: $PF_PID)"
+        log_info "Port-forwarding to $pod_name:9443 → localhost:$LOCAL_PORT (attempt $((attempt + 1)))"
+        oc port-forward -n "$OPERATOR_NS" "pod/$pod_name" "${LOCAL_PORT}:9443" >/dev/null 2>&1 &
+        PF_PID=$!
+
+        # Wait for the port-forward to be ready
+        local wait=0
+        local pf_ready=false
+        while [ "$wait" -lt 15 ]; do
+            sleep 2
+            wait=$((wait + 2))
+            if ! kill -0 "$PF_PID" 2>/dev/null; then
+                break
+            fi
+            # Check if port is accepting connections using nc (netcat)
+            if nc -z 127.0.0.1 "$LOCAL_PORT" 2>/dev/null; then
+                pf_ready=true
+                break
+            fi
+        done
+
+        if [ "$pf_ready" = true ]; then
+            log_pass "Port-forward active and accepting connections (PID: $PF_PID)"
             return 0
         fi
+
+        # Clean up failed attempt
+        kill "$PF_PID" 2>/dev/null || true
+        wait "$PF_PID" 2>/dev/null || true
+        PF_PID=""
+
         attempt=$((attempt + 1))
         if [ "$attempt" -lt 3 ]; then
-            log_info "Port-forward attempt $attempt failed, retrying..."
             LOCAL_PORT=$((LOCAL_PORT + 1))
-            log_info "Trying port $LOCAL_PORT"
-            oc port-forward -n "$OPERATOR_NS" "pod/$pod_name" "${LOCAL_PORT}:9443" >/dev/null 2>&1 &
-            PF_PID=$!
+            log_info "Retrying on port $LOCAL_PORT..."
         fi
     done
 
@@ -312,7 +333,87 @@ stop_port_forward() {
 }
 
 # ---------------------------------------------------------------------------
-# Verify TLS on the webhook port
+# In-cluster TLS check: run openssl from a temporary pod against the
+# operator pod IP, bypassing oc port-forward entirely.
+# ---------------------------------------------------------------------------
+TLS_TEST_POD="tls-probe-$$"
+
+get_operator_pod_ip() {
+    local pod_name
+    pod_name=$(oc get pods -n "$OPERATOR_NS" -l "app=${OPERATOR_DEPLOY}" \
+        --field-selector=status.phase=Running --no-headers 2>/dev/null \
+        | head -1 | awk '{print $1}' || true)
+    if [ -z "$pod_name" ]; then
+        pod_name=$(oc get pods -n "$OPERATOR_NS" --no-headers 2>/dev/null \
+            | grep "$OPERATOR_DEPLOY" | grep "Running" | head -1 | awk '{print $1}' || true)
+    fi
+    if [ -z "$pod_name" ]; then
+        echo ""
+        return 1
+    fi
+    local pod_ip
+    pod_ip=$(oc get pod -n "$OPERATOR_NS" "$pod_name" -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+    echo "$pod_ip"
+}
+
+ensure_tls_probe_pod() {
+    if oc get pod -n "$OPERATOR_NS" "$TLS_TEST_POD" --no-headers 2>/dev/null | grep -q "Running"; then
+        return 0
+    fi
+    log_info "Launching in-cluster TLS probe pod ($TLS_TEST_POD)..."
+    oc run "$TLS_TEST_POD" -n "$OPERATOR_NS" \
+        --image=registry.access.redhat.com/ubi9/ubi:latest \
+        --restart=Never \
+        --command -- sleep 600 >/dev/null 2>&1 || true
+
+    local wait_count=0
+    while [ "$wait_count" -lt 60 ]; do
+        if oc get pod -n "$OPERATOR_NS" "$TLS_TEST_POD" --no-headers 2>/dev/null | grep -q "Running"; then
+            log_pass "TLS probe pod is running"
+            return 0
+        fi
+        sleep 3
+        wait_count=$((wait_count + 3))
+    done
+    log_fail "TLS probe pod failed to start within 60s"
+    return 1
+}
+
+cleanup_tls_probe_pod() {
+    oc delete pod -n "$OPERATOR_NS" "$TLS_TEST_POD" --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
+}
+
+run_openssl_in_cluster() {
+    local pod_ip="$1"
+    shift
+    # remaining args are extra openssl flags (e.g. -tls1_2, -tls1_3)
+    oc exec -n "$OPERATOR_NS" "$TLS_TEST_POD" -- \
+        timeout 10 openssl s_client -connect "${pod_ip}:9443" "$@" </dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Check if an openssl s_client output represents a SUCCESSFUL TLS handshake.
+# Returns 0 if the handshake succeeded, 1 if it failed.
+# A failed handshake may still show "Protocol : TLSv1.2" but with cipher
+# "(NONE)" or "0000", or contain "handshake failure" / "no peer certificate".
+tls_handshake_succeeded() {
+    local output="$1"
+    local cipher
+    cipher=$(echo "$output" | grep -E "Cipher\s*:" | head -1 | sed 's/.*Cipher[[:space:]]*:[[:space:]]*//' || true)
+
+    if [ -z "$cipher" ] || [ "$cipher" = "(NONE)" ] || [ "$cipher" = "0000" ]; then
+        return 1
+    fi
+    if echo "$output" | grep -qi "handshake failure"; then
+        return 1
+    fi
+    if echo "$output" | grep -qi "ssl handshake has read 0 bytes"; then
+        return 1
+    fi
+    return 0
+}
+
+# Verify TLS on the webhook port (in-cluster approach)
 # ---------------------------------------------------------------------------
 verify_webhook_tls() {
     local expected_min_ver="$1"
@@ -323,21 +424,36 @@ verify_webhook_tls() {
 
     log_step "Verifying webhook TLS for profile: $profile_label (expected min: $expected_proto)"
 
-    if ! start_port_forward; then
+    local pod_ip
+    pod_ip=$(get_operator_pod_ip)
+    if [ -z "$pod_ip" ]; then
+        log_fail "Cannot determine operator pod IP"
+        return 1
+    fi
+    log_info "Operator pod IP: $pod_ip, webhook port: 9443"
+
+    if ! ensure_tls_probe_pod; then
         return 1
     fi
 
     local tls_output actual_proto actual_cipher
 
-    tls_output=$(echo | openssl s_client -connect "localhost:${LOCAL_PORT}" 2>&1 || true)
-    actual_proto=$(echo "$tls_output" | grep -E "^\s*Protocol\s*:" | awk -F: '{gsub(/^[ \t]+/, "", $2); print $2}' || true)
-    actual_cipher=$(echo "$tls_output" | grep -E "^\s*Cipher\s*:" | head -1 | awk -F: '{gsub(/^[ \t]+/, "", $2); print $2}' || true)
+    tls_output=$(run_openssl_in_cluster "$pod_ip")
+
+    log_info "[$profile_label] Raw openssl output (first 20 lines):"
+    echo "$tls_output" | head -20 | sed 's/^/    /'
+
+    actual_proto=$(echo "$tls_output" | grep -E "Protocol\s*:" | head -1 | sed 's/.*Protocol[[:space:]]*:[[:space:]]*//' || true)
+    actual_cipher=$(echo "$tls_output" | grep -E "Cipher\s*:" | head -1 | sed 's/.*Cipher[[:space:]]*:[[:space:]]*//' || true)
+
+    if [ -z "$actual_proto" ] || [ "$actual_proto" = "(NONE)" ]; then
+        # Fallback: check for "New, TLSv1.x" pattern
+        actual_proto=$(echo "$tls_output" | grep -oE "New, TLSv1\.[0-3]" | head -1 | sed 's/New, //' || true)
+    fi
 
     if [ -z "$actual_proto" ] || [ "$actual_proto" = "(NONE)" ]; then
         log_fail "[$profile_label] Cannot establish TLS connection to webhook on port 9443"
-        log_info "  openssl output (last 10 lines):"
-        echo "$tls_output" | tail -10 | sed 's/^/    /'
-        stop_port_forward
+        cleanup_tls_probe_pod
         return 1
     fi
 
@@ -345,16 +461,25 @@ verify_webhook_tls() {
 
     case "$expected_min_ver" in
         VersionTLS13)
-            local tls13_out tls12_out
-            tls13_out=$(echo | openssl s_client -connect "localhost:${LOCAL_PORT}" -tls1_3 2>&1 || true)
-            if echo "$tls13_out" | grep -qE "Protocol\s*:\s*TLSv1\.3"; then
-                log_pass "[$profile_label] TLS 1.3 connection succeeded (expected for Modern)"
+            if echo "$actual_proto" | grep -q "TLSv1.3" && tls_handshake_succeeded "$tls_output"; then
+                log_pass "[$profile_label] TLS 1.3 connection succeeded (default negotiation)"
             else
-                log_fail "[$profile_label] TLS 1.3 connection failed"
+                local tls13_out
+                tls13_out=$(run_openssl_in_cluster "$pod_ip" -tls1_3)
+                if tls_handshake_succeeded "$tls13_out"; then
+                    log_pass "[$profile_label] TLS 1.3 connection succeeded (expected for Modern)"
+                else
+                    log_fail "[$profile_label] TLS 1.3 connection failed"
+                    log_info "  openssl output (last 5 lines):"
+                    echo "$tls13_out" | tail -5 | sed 's/^/    /'
+                fi
             fi
 
-            tls12_out=$(echo | openssl s_client -connect "localhost:${LOCAL_PORT}" -tls1_2 2>&1 || true)
-            if echo "$tls12_out" | grep -qE "Protocol\s*:\s*TLSv1\.2"; then
+            local tls12_out
+            tls12_out=$(run_openssl_in_cluster "$pod_ip" -tls1_2)
+            log_info "[$profile_label] TLS 1.2 attempt output (last 8 lines):"
+            echo "$tls12_out" | tail -8 | sed 's/^/    /'
+            if tls_handshake_succeeded "$tls12_out"; then
                 log_fail "[$profile_label] TLS 1.2 accepted (should be rejected for Modern)"
             else
                 log_pass "[$profile_label] TLS 1.2 correctly rejected"
@@ -363,16 +488,16 @@ verify_webhook_tls() {
 
         VersionTLS12)
             local tls12_out
-            tls12_out=$(echo | openssl s_client -connect "localhost:${LOCAL_PORT}" -tls1_2 2>&1 || true)
-            if echo "$tls12_out" | grep -qE "Protocol\s*:\s*TLSv1\.2"; then
+            tls12_out=$(run_openssl_in_cluster "$pod_ip" -tls1_2)
+            if tls_handshake_succeeded "$tls12_out"; then
                 log_pass "[$profile_label] TLS 1.2 connection succeeded (expected for Intermediate)"
             else
                 log_fail "[$profile_label] TLS 1.2 connection failed"
             fi
 
             local tls13_out
-            tls13_out=$(echo | openssl s_client -connect "localhost:${LOCAL_PORT}" -tls1_3 2>&1 || true)
-            if echo "$tls13_out" | grep -qE "Protocol\s*:\s*TLSv1\.3"; then
+            tls13_out=$(run_openssl_in_cluster "$pod_ip" -tls1_3)
+            if tls_handshake_succeeded "$tls13_out"; then
                 log_pass "[$profile_label] TLS 1.3 also accepted (correct — it's >= 1.2)"
             else
                 log_info "[$profile_label] TLS 1.3 not negotiated (may be cipher mismatch, non-critical)"
@@ -380,7 +505,7 @@ verify_webhook_tls() {
             ;;
 
         VersionTLS11|VersionTLS10)
-            if [ -n "$actual_proto" ] && [ "$actual_proto" != "(NONE)" ]; then
+            if tls_handshake_succeeded "$tls_output"; then
                 log_pass "[$profile_label] TLS connection succeeded (protocol: $actual_proto)"
             else
                 log_fail "[$profile_label] TLS connection failed"
@@ -388,16 +513,15 @@ verify_webhook_tls() {
             ;;
     esac
 
-    # Show cipher suites the server accepts
     log_info "[$profile_label] Checking advertised cipher suites..."
     local cipher_list
-    cipher_list=$(echo | openssl s_client -connect "localhost:${LOCAL_PORT}" -cipher 'ALL:eNULL' 2>&1 \
+    cipher_list=$(run_openssl_in_cluster "$pod_ip" -cipher 'ALL:eNULL' \
         | grep -E "^\s*Cipher\s*:" | head -1 | awk -F: '{gsub(/^[ \t]+/, "", $2); print $2}' || true)
     if [ -n "$cipher_list" ] && [ "$cipher_list" != "(NONE)" ] && [ "$cipher_list" != "0000" ]; then
         log_info "  Negotiated cipher: $cipher_list"
     fi
 
-    stop_port_forward
+    cleanup_tls_probe_pod
 }
 
 # ---------------------------------------------------------------------------
@@ -405,29 +529,20 @@ verify_webhook_tls() {
 # ---------------------------------------------------------------------------
 wait_mgmt_kube_apiserver() {
     local wait_time="${1:-$MGMT_KAS_TIMEOUT}"
+    local timeout_min=$((wait_time / 60))
 
-    log_info "Waiting for management cluster kube-apiserver to stabilize (timeout: ${wait_time}s)..."
+    log_info "Waiting for management cluster to stabilize (timeout: ${timeout_min}m)..."
+    log_info "(This may take 15-30 minutes as control plane nodes roll out sequentially)"
 
-    local elapsed=0
-    local interval=30
-    while [ "$elapsed" -lt "$wait_time" ]; do
-        local available progressing degraded
-        available=$(oc get co kube-apiserver -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "Unknown")
-        progressing=$(oc get co kube-apiserver -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || echo "Unknown")
-        degraded=$(oc get co kube-apiserver -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}' 2>/dev/null || echo "Unknown")
-
-        if [ "$available" = "True" ] && [ "$progressing" = "False" ] && [ "$degraded" = "False" ]; then
-            log_pass "Management cluster kube-apiserver is stable"
-            return 0
-        fi
-
-        log_info "  [${elapsed}s] Available=$available Progressing=$progressing Degraded=$degraded"
-        sleep "$interval"
-        elapsed=$((elapsed + interval))
-    done
-
-    log_fail "Management kube-apiserver did not stabilize within ${wait_time}s"
-    return 1
+    if oc adm wait-for-stable-cluster --timeout="${timeout_min}m" 2>&1; then
+        log_pass "Management cluster is stable"
+        return 0
+    else
+        log_fail "Management cluster did not stabilize within ${timeout_min}m"
+        log_info "Current cluster operator status:"
+        oc get co 2>/dev/null | grep -vE "True.*False.*False" | head -20 || true
+        return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -682,9 +797,19 @@ run_profile_step() {
     log_info "(This can take 15-30 minutes as the management cluster kube-apiserver restarts)"
     wait_mgmt_kube_apiserver "$MGMT_KAS_TIMEOUT"
 
-    restart_operator
-
-    verify_webhook_tls "$expected_ver" "$profile_label"
+    # Phase 1: Test WITHOUT restarting operator pods (dynamic pickup)
+    log_step "$step_name-a) Verifying webhook TLS WITHOUT operator restart (dynamic config)"
+    log_info "Waiting 30s for operator to pick up new APIServer TLS profile dynamically..."
+    sleep 30
+    if verify_webhook_tls "$expected_ver" "$profile_label (no-restart)"; then
+        log_pass "Operator dynamically picked up $profile_label TLS profile — no restart needed"
+    else
+        # Phase 2: Restart and re-test
+        log_info "Dynamic pickup did not reflect $profile_label — restarting operator pods..."
+        restart_operator
+        log_step "$step_name-b) Verifying webhook TLS AFTER operator restart"
+        verify_webhook_tls "$expected_ver" "$profile_label (after-restart)"
+    fi
 }
 
 test_profile_switch() {
